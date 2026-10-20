@@ -20,6 +20,7 @@ const uint8_t jttySync[JTTY_SYNC_LEN] PROGMEM = {0,2,2,3,0,0,3,2,1,3,1,2,0};
 
 uint16_t jttyDataCount = 0;        // published data symbols (multiple of 46)
 bool     jttyRxActive  = false;
+bool     jttyTune      = false;
 static uint16_t jttyRxPos;         // next data symbol to write
 static bool     jttyRxBad;         // bad char or overflow in this command
 
@@ -54,12 +55,18 @@ void jttyRxBegin()
   } else {
     jttyDataCount = 0;                         // new message
     jttyRxPos     = 0;
+    jttyTune      = false;
   }
 }
 
 void jttyRxChar(char c)
 {
   if (jttyRxBad) return;
+  if (c == 'T' && jttyRxPos == 0 && jttyDataCount == 0) {   // {JT} = tune
+    jttyTune = true;
+    return;
+  }
+  if (jttyTune) { jttyRxBad = true; return; }  // nothing may follow T
   uint8_t v = jttyHexVal(c);
   if (v == 0xFF || jttyRxPos + 2 > JTTY_MAX_DATA) { jttyRxBad = true; return; }
   jttyPutSymbol(jttyRxPos++, v & 3);
@@ -74,6 +81,7 @@ void jttyRxEnd()
     jttyDataCount = jttyRxPos;
   }
   // else: rejected - leave jttyDataCount unchanged
+  if (jttyRxBad) jttyTune = false;             // malformed {JT...} is not a tune request
   // Optional ack for the PC log, e.g. {jN} with N = frames now held:
   // Serial.print("{j"); Serial.print(jttyDataCount / JTTY_DATA_LEN); Serial.print('}');
 }
@@ -101,6 +109,7 @@ void jttyReset()
   jttyDataCount = 0;
   jttyRxActive  = false;
   jttyRxPos     = 0;
+  jttyTune      = false;
 }
 
 
@@ -137,6 +146,17 @@ void transmitJtty()
   uint32_t lastFTW = 0;
   // start the transition half its length before each symbol boundary (as FTx)
   uint32_t halfTranMs = (gTranSteps * gTranMicrosPerStep) / 2000UL;
+
+  if (jttyTune)                          // {JT}: steady carrier on tone 0 until {X0}
+  {
+    dds.setFTW(dds.frequencyFTW((CurFreq + FTxTxDF) * 10UL), PowerUp);
+    while (DigiTxOn)                     // {X0}, SWR/temperature lockout
+    {
+      SWRmeasure();
+      ProcessSerialIn();
+    }
+    goto done;
+  }
 
   for (uint16_t i = 0; i < jttyTotalSymbols(); i++)          // re-read: chaining
   {

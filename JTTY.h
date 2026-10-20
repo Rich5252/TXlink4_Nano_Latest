@@ -12,8 +12,9 @@
 //                digits per frame. Each hex digit = 2 symbols: s0 | (s1 << 2).
 //                Sent while idle = new message; sent while transmitting JTTY =
 //                appended (gapless chaining).
-//   {X1}         start (always send after {J..}; harmless if already on)
-//   {X0}         abort immediately
+//   {JT}         tune: steady carrier on tone 0 (the JTTY base freq) until {X0}
+//   {X1}         start (always send after {J..} or {JT}; harmless if already on)
+//   {X0}         abort / stop tune immediately
 //
 // Storage: data symbols are packed 4 per byte into the RTTY queue buffer
 // (message_buffer, 288 bytes), which is unused in JTTY mode. 16 frames need
@@ -41,6 +42,7 @@
 // --- State (defined in JTTY.ino) -------------------------------------------------
 extern uint16_t jttyDataCount;     // data symbols published (whole frames only)
 extern bool     jttyRxActive;      // true while inside a {J...} command
+extern bool     jttyTune;          // {JT} received: transmitJtty() sends a steady carrier
 
 // --- Serial receive (called from ProcessSerialIn) --------------------------------
 void jttyRxBegin();                // 'J' seen as first char after '{'
