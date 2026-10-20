@@ -47,6 +47,7 @@
 
 #include "RTTY.h"
 #include "rtty_queue.h"
+#include "JTTY.h"
 
 #include "FormatUtils.h"      //output serial message formatting
 
@@ -145,7 +146,7 @@ bool    ExtPAon = false;
 
 
 // Digital mode enumeration. "{Mx}" command sets mode = x
-enum mode {MODE_RTTY = 1, MODE_FT2 = 2, MODE_FT4 = 4, MODE_FT8 = 8};
+enum mode {MODE_RTTY = 1, MODE_FT2 = 2, MODE_FT4 = 4, MODE_FT8 = 8, MODE_JTTY = 16};
 #define DEFAULT_MODE            MODE_FT8
 
 // "ERROR G4AHN" symbol lists
@@ -224,12 +225,86 @@ const uint16_t Gaussian_G_Scaled[33] PROGMEM = {
 //    * the time to end of TX period {Wx} command. NOTE this is derived from WSJTX
 //         and needs to be accurate to ensure best chance of decode by receiver.
 // 
+// Gaussian frequency transition from lastFTW to nextFTW (FTW units).
+// Shared by FT8/FT4/FT2 (DigitalTXmsg) and JTTY (transmitJtty).
+#ifndef ROUNDING_OFFSET
+#define ROUNDING_OFFSET  32768UL       // 0.5 * 2^16 for rounding during division by 2^16
+#endif
+void gaussianTransition(uint32_t lastFTW, uint32_t nextFTW)
+{
+  //gaussian transition to next tone
+  uint32_t next_gStep_time = micros();
+  // Gaussian LookUpTable version
+  // LUT contains UINT16_t gaussian fractions values scaled up by x2^16
+  // There are 32 increments in table (33 elements starting at 0, ending at 1 * 2^16 (-1))
+  // Remember that freq goes up and down so take care of signs
+  // For speed we are using the Freq Tuning Word on AD9851 DDS directly
+  // lastFTW & nextFTW are the adjacent tone freqs (FTW units)
+  int32_t gTranChangeFTW = (int32_t) (nextFTW - lastFTW); //+/- Freq Transition expressed in AD9851 FTW units
+  
+  // top level loop scans Gaussian_G_Scaled[] LookupTable
+  for (int g = 1; g <= gTranSteps / gTranInterpFactor ; g++)      //LUT[0] = 0 plus 32 increments
+  {                                                               //for all steps in LUT
+    //sp(gTranChangeFTW);
+
+    //Prog mem for array to save on RAM
+    uint16_t G_scaled_current = pgm_read_word(&Gaussian_G_Scaled[g]);
+    uint16_t G_scaled_previous = pgm_read_word(&Gaussian_G_Scaled[g - 1]);
+
+    // 1. Find the gaussian LUT step size for interpolation
+    uint16_t gLUTDelta = G_scaled_current - G_scaled_previous;
+
+    // Find the interpolation step size. gTranInterpFactor needs to be an integer value
+    uint16_t gLUTStepDeltaIncr = gLUTDelta / gTranInterpFactor;
+
+    //inner loop interpolates between LUT points.
+    //gTranInterpFactor is the interpolation points required
+    for (int h = 1; h <= gTranInterpFactor; h++)
+    {                                                   //interpolate additional gTranInterpFactor steps
+      // calc interpolated gaussian fraction
+      uint16_t gLUTinterp = G_scaled_previous + gLUTStepDeltaIncr * h;
+
+      // calc FTW change for this step that can be +/-
+      int64_t FTW_CHANGE_SCALED = (uint64_t) gLUTinterp * (int64_t) gTranChangeFTW;   //signed scaled change
+
+      // Apply rounding and divide by 2^16 to derive FTW change for this step
+      int32_t gTranFTW_delta = (int32_t)((FTW_CHANGE_SCALED + ROUNDING_OFFSET) >> 16);
+      
+      // new transition step frequency
+      uint32_t gTranFTW = lastFTW + gTranFTW_delta;
+      dds.setFTW(gTranFTW, PowerUp);   //set DDS output
+    
+      //calc end time for this step
+      next_gStep_time += gTranMicrosPerStep;
+  /*
+      //These are VERY SLOW
+      Serial.print((micros()-next_gStep_time)/gTranMicrosPerStep); Serial.print(" ");
+      sp(g); sp(h); sp(G_scaled_previous); sp(G_scaled_current);
+      Serial.print(gLUTStepDeltaIncr); Serial.print(" ");
+      Serial.print(gLUTinterp); Serial.print(" ");
+      sp(gTranChangeFTW); sp((uint32_t)FTW_SCALED); sp(freeRam());
+      Serial.println(gTranFTW);
+  */
+      //delay to end of this time increment
+      //there shouldn't be much time here if we using the "minimum" gTranMicrosPerStep
+      //minimum is ~55 microsecs.
+      //obviously coding will be corrupted if gTranMicrosPerStep < minimum (time required to process loop)
+      while (micros() < next_gStep_time) {}       
+    } //End of gaussian inner interpolation loop
+  } //End of outer loop that scans LUT
+}
+
 void DigitalTXmsg()
 {  
   // quick exit if RTTY
   if (TxMode == MODE_RTTY)
   {
     transmitRttyString();     //checks rtty message queue and TX until empty
+    return;
+  }
+  if (TxMode == MODE_JTTY)
+  {
+    transmitJtty();           //JTTY.ino - runs until all frames sent or {X0}
     return;
   }
   
@@ -268,66 +343,7 @@ void DigitalTXmsg()
     }
     else
     {
-      //gaussian transition to next tone
-      uint32_t next_gStep_time = micros();
-      // Gaussian LookUpTable version
-      // LUT contains UINT16_t gaussian fractions values scaled up by x2^16
-      // There are 32 increments in table (33 elements starting at 0, ending at 1 * 2^16 (-1))
-      // Remember that freq goes up and down so take care of signs
-      // For speed we are using the Freq Tuning Word on AD9851 DDS directly
-      // lastFTW & nextFTW are the adjacent tone freqs (FTW units)
-      int32_t gTranChangeFTW = (int32_t) (nextFTW - lastFTW); //+/- Freq Transition expressed in AD9851 FTW units
-  
-      // top level loop scans Gaussian_G_Scaled[] LookupTable
-      for (int g = 1; g <= gTranSteps / gTranInterpFactor ; g++)      //LUT[0] = 0 plus 32 increments
-      {                                                               //for all steps in LUT
-        //sp(gTranChangeFTW);
-
-        //Prog mem for array to save on RAM
-        uint16_t G_scaled_current = pgm_read_word(&Gaussian_G_Scaled[g]);
-        uint16_t G_scaled_previous = pgm_read_word(&Gaussian_G_Scaled[g - 1]);
-
-        // 1. Find the gaussian LUT step size for interpolation
-        uint16_t gLUTDelta = G_scaled_current - G_scaled_previous;
-
-        // Find the interpolation step size. gTranInterpFactor needs to be an integer value
-        uint16_t gLUTStepDeltaIncr = gLUTDelta / gTranInterpFactor;
-
-        //inner loop interpolates between LUT points.
-        //gTranInterpFactor is the interpolation points required
-        for (int h = 1; h <= gTranInterpFactor; h++)
-        {                                                   //interpolate additional gTranInterpFactor steps
-          // calc interpolated gaussian fraction
-          uint16_t gLUTinterp = G_scaled_previous + gLUTStepDeltaIncr * h;
-
-          // calc FTW change for this step that can be +/-
-          int64_t FTW_CHANGE_SCALED = (uint64_t) gLUTinterp * (int64_t) gTranChangeFTW;   //signed scaled change
-
-          // Apply rounding and divide by 2^16 to derive FTW change for this step
-          int32_t gTranFTW_delta = (int32_t)((FTW_CHANGE_SCALED + ROUNDING_OFFSET) >> 16);
-          
-          // new transition step frequency
-          uint32_t gTranFTW = lastFTW + gTranFTW_delta;
-          dds.setFTW(gTranFTW, PowerUp);   //set DDS output
-        
-          //calc end time for this step
-          next_gStep_time += gTranMicrosPerStep;
-  /*
-          //These are VERY SLOW
-          Serial.print((micros()-next_gStep_time)/gTranMicrosPerStep); Serial.print(" ");
-          sp(g); sp(h); sp(G_scaled_previous); sp(G_scaled_current);
-          Serial.print(gLUTStepDeltaIncr); Serial.print(" ");
-          Serial.print(gLUTinterp); Serial.print(" ");
-          sp(gTranChangeFTW); sp((uint32_t)FTW_SCALED); sp(freeRam());
-          Serial.println(gTranFTW);
-  */
-          //delay to end of this time increment
-          //there shouldn't be much time here if we using the "minimum" gTranMicrosPerStep
-          //minimum is ~55 microsecs.
-          //obviously coding will be corrupted if gTranMicrosPerStep < minimum (time required to process loop)
-          while (micros() < next_gStep_time) {}       
-        } //End of gaussian inner interpolation loop
-      } //End of outer loop that scans LUT
+      gaussianTransition(lastFTW, nextFTW);    //gaussian transition to next tone
     } //End of gaussian transition to new tone
 
     //Serial.print(i); Serial.print(" "); Serial.print(lastFTW); Serial.print(" "); Serial.print(nextFTW); Serial.print(" "); Serial.println(freeRam());
@@ -527,6 +543,10 @@ void setDigDefaults()
   case MODE_RTTY:
     symbol_count = -1;
     break;
+
+  case MODE_JTTY:
+    setJttyDefaults();
+    break;
   }
 }
 
@@ -598,6 +618,7 @@ void loop() {
         long TxDelay = FT8txDelay;
         if (TxMode == MODE_FT4) {TxDelay = TxDelay / 2;}
         if (TxMode == MODE_FT2) {TxDelay = 0;}            //no time for delay!
+        if (TxMode == MODE_JTTY) {TxDelay = 0;}           //no T/R period: start now
         long startFT8delay = millis();
         while (millis() - startFT8delay < TxDelay)
         {
@@ -845,6 +866,19 @@ void ProcessSerialIn() {
   {
     nextChar = Serial.read();
 
+    // JTTY {J<hex>} payload is decoded straight into packed storage (JTTY.ino)
+    if (jttyRxActive)
+    {
+      if (nextChar == '}') { jttyRxEnd(); chrCommand[0] = '\0'; }
+      else                 { jttyRxChar(nextChar); }
+      continue;
+    }
+    if (nextChar == 'J' && chrCommand[0] == '\0' && TxMode == MODE_JTTY)
+    {
+      jttyRxBegin();
+      continue;
+    }
+
     if (nextChar == '{')
     {
         // Start of command: clear the buffer by setting the first char to null terminator
@@ -953,6 +987,7 @@ void ProcessSerialIn() {
       {
           DigiTxOn = atoi(&chrCommand[1]);
           if (!DigiTxOn) { clearQueue(); }    //clear down any outstanding RTTY messages on {X0}
+          if (!DigiTxOn && TxMode == MODE_JTTY) { jttyReset(); }    //JTTY abort
           //Serial.print(chrCommand);Serial.print("  DigiTxOn="); Serial.println(DigiTxOn);
       }
       else if (strncmp(chrCommand, "Y", 1) == 0)    //FT8 TX freq offset
