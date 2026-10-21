@@ -125,8 +125,8 @@ void setJttyDefaults()
   tone_duration             = JTTY_tone_duration;         // 32 ms
 
   // Gaussian transitions: BT=2 like FT8, so ~10% of the symbol = ~3.2 ms
-  gTranSteps         = 32;            // MUST BE 32*n
-  gTranMicrosPerStep = 100;           // 32 x 100 us = 3.2 ms
+  gTranSteps         = 64;            // MUST BE 32*n
+  gTranMicrosPerStep = 64;           // 32 x 100 us = 3.2 ms, 64 x 64 us = 4.096 ms, 64 x 50 us = 3.2 ms
   gTranInterpFactor  = gTranSteps / 32;
 
   clearQueue();                       // RTTY must not use the shared buffer
